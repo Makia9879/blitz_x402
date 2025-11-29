@@ -44,7 +44,7 @@ const DashboardPage = () => {
   const [balance, setBalance] = useState<BalanceSummary>()
   const [loadingBalance, setLoadingBalance] = useState(true)
   const [balanceError, setBalanceError] = useState<string>()
-  const pollingRef = useRef<number | undefined>(undefined)
+  // const pollingRef = useRef<number | undefined>(undefined)
   const mountedRef = useRef(true)
 
   const loadBalance = useCallback(
@@ -160,13 +160,6 @@ const DashboardPage = () => {
               <p className="text-sm uppercase tracking-[0.3em] text-white/60">模块二</p>
               <h2 className="mt-2 text-2xl font-semibold text-white">充值余额总览</h2>
             </div>
-            <button
-              type="button"
-              onClick={() => loadBalance(true)}
-              className="rounded-full border border-white/20 px-4 py-2 text-xs text-white/80 transition hover:border-white/50"
-            >
-              刷新额度
-            </button>
           </div>
           <div className="mt-8">
             <p className="text-sm text-white/60">可用余额</p>
