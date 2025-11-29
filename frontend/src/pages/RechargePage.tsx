@@ -21,6 +21,7 @@ const RechargePage = () => {
   const [error, setError] = useState<string>()
   const navigate = useNavigate()
   const { wallet } = useWalletContext()
+  console.log('wallet-----charge', wallet)
   const { account } = wallet
 
   const amount = useMemo(() => {

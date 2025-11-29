@@ -49,9 +49,10 @@ const DashboardPage = () => {
 
   const loadBalance = useCallback(
     async (withLoader = false) => {
-      if (withLoader) {
-        setLoadingBalance(true)
-      }
+      console.log('withLoader---', withLoader)
+      // if (withLoader) {
+      //   setLoadingBalance(true)
+      // }
       try {
         const data = await fetchBalance()
         if (!mountedRef.current) return
@@ -180,7 +181,7 @@ const DashboardPage = () => {
                 </p>
               </div>
             </div> */}
-            {balanceError && <p className="mt-4 text-sm text-rose-300">{balanceError}</p>}
+            {/* {balanceError && <p className="mt-4 text-sm text-rose-300">{balanceError}</p>} */}
             <button
               type="button"
               onClick={() => navigate('/recharge')}

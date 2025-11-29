@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "noEmitOnError": false,
     "tsBuildInfoFile": "./tsconfig.node.tsbuildinfo",
     "target": "ES2023",
     "lib": ["ES2023"],
