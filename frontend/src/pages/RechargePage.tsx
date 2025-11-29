@@ -39,12 +39,33 @@ const RechargePage = () => {
       setError('请先连接 Monad 测试网钱包')
       return
     }
+    const provider = window.ethereum
+    if (!provider) {
+      setError('请先安装 MetaMask 扩展')
+      return
+    }
     try {
       setSubmitting(true)
       setError(undefined)
-      const result = await submitRecharge({ amount, account, method })
+      const signaturePayload = [
+        'Authorize Recharge',
+        `Account: ${account}`,
+        `Amount: ${amount}`,
+        `Method: ${method}`,
+        `Timestamp: ${new Date().toISOString()}`,
+      ].join('\n')
+      const signature = (await provider.request({
+        method: 'personal_sign',
+        params: [signaturePayload, account],
+      })) as string
+      const result = await submitRecharge({ amount, account, method, signature })
       setResultId(result.txId)
     } catch (err) {
+      const errorWithCode = err as { code?: number }
+      if (errorWithCode?.code === 4001) {
+        setError('已取消签名请求')
+        return
+      }
       const message = err instanceof Error ? err.message : '充值请求失败'
       setError(message)
     } finally {

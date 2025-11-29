@@ -16,6 +16,7 @@ export interface RechargeRequest {
   amount: number
   method: PaymentMethod
   account: string
+  signature: string
 }
 
 export interface RechargeResponse {
@@ -36,7 +37,7 @@ export const fetchBalance = async (): Promise<BalanceSummary> => {
   }
 }
 
-export const submitRecharge = async ({ amount, method, account }: RechargeRequest): Promise<RechargeResponse> => {
+export const submitRecharge = async ({ amount, method, account, signature }: RechargeRequest): Promise<RechargeResponse> => {
   await delay(900)
   if (amount <= 0) {
     throw new Error('充值金额必须大于 0')
@@ -45,7 +46,7 @@ export const submitRecharge = async ({ amount, method, account }: RechargeReques
     throw new Error('单笔金额超过风控限制，请联系管理员')
   }
 
-  console.log('submitRecharge---', { amount, method, account })
+  console.log('submitRecharge---', { amount, method, account, signature })
 
 
   const txId = `${account}-TX-${Math.floor(Math.random() * 1_000_000)
