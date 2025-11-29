@@ -7,9 +7,11 @@ Python后端 - 使用x402协议处理加密货币充值和余额查询
 import os
 import json
 from typing import Optional
+from decimal import Decimal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
@@ -17,6 +19,7 @@ from eth_account import Account
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+import httpx
 
 load_dotenv()
 
@@ -38,6 +41,13 @@ MON_ADDRESS = os.getenv("MON_ADDRESS", "")  # MON ERC20代币地址（如果使�
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "10143"))
 TRANSIT_WALLET = os.getenv("TRANSIT_WALLET", "")  # 中转站钱包地址（接收 MON）
+
+# Claude API 代理配置
+CLAUDE_BACKEND_URL = os.getenv("CLAUDE_BACKEND_URL", "")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+MON_TO_TOKEN_RATE = int(os.getenv("MON_TO_TOKEN_RATE", "100000"))  # 1 MON = 10万 tokens
+MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "8192"))
+CLAUDE_REQUEST_TIMEOUT = int(os.getenv("CLAUDE_REQUEST_TIMEOUT", "300"))  # 秒
 
 # 数据库配置（MySQL）
 MYSQL_DSN = os.getenv(
@@ -159,6 +169,44 @@ class InternalRecharge(BaseModel):
     user_address: str
     amount: str = Field(..., description="充值金额（人类可读 MON 数量，如 1.0）")
     client_type: str = Field("x402-gateway", description="调用方类型")
+
+
+# ========== Claude API 代理相关模型 ==========
+
+class ClaudeMessage(BaseModel):
+    """Claude 消息"""
+    role: str
+    content: str
+
+
+class ClaudeMessageRequest(BaseModel):
+    """Claude API 请求（兼容 Claude API 格式）"""
+    model: str
+    messages: list[dict]
+    max_tokens: Optional[int] = 4096
+    temperature: Optional[float] = 1.0
+    stream: Optional[bool] = False
+    system: Optional[str] = None
+    metadata: Optional[dict] = None
+    stop_sequences: Optional[list[str]] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+
+
+class ClaudeUsageInfo(BaseModel):
+    """Token 使用统计"""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: Optional[int] = 0
+    cache_read_input_tokens: Optional[int] = 0
+
+
+class ClaudeErrorResponse(BaseModel):
+    """Claude 代理错误响应"""
+    error: str
+    message: str
+    current_balance_mon: Optional[str] = None
+    required_mon: Optional[str] = None
 
 
 # 工具函数
@@ -481,6 +529,376 @@ async def get_balance_get(user_address: str):
     查询用户余额（GET方式）
     """
     return await get_balance(BalanceQuery(user_address=user_address))
+
+
+# ========== Claude API 代理相关函数 ==========
+
+async def check_and_deduct_balance(
+    user_address: str,
+    max_tokens: int,
+    db: Session
+) -> tuple[bool, Optional[str], Optional[Decimal]]:
+    """
+    检查余额并预扣费
+
+    Args:
+        user_address: 用户钱包地址
+        max_tokens: 请求的最大 tokens
+        db: 数据库 Session
+
+    Returns:
+        (成功标志, 错误信息, 当前余额 MON)
+    """
+    # 1. 地址标准化
+    try:
+        user_address = Web3.to_checksum_address(user_address)
+    except Exception as e:
+        return False, f"Invalid address: {str(e)}", None
+
+    # 2. 计算预估消耗（加 20% 安全系数）
+    estimated_tokens = max_tokens * 1.2
+    estimated_mon_wei = int((estimated_tokens / MON_TO_TOKEN_RATE) * 1e18)
+
+    # 3. 查询当前余额
+    result = db.execute(
+        text("SELECT balance FROM user_balances WHERE user_address = :addr"),
+        {"addr": user_address}
+    ).fetchone()
+
+    if not result:
+        return False, "User balance not found", None
+
+    current_balance = result[0]
+    current_balance_mon = Decimal(current_balance) / Decimal(1e18)
+
+    # 4. 检查余额
+    if current_balance < estimated_mon_wei:
+        return False, "Insufficient balance", current_balance_mon
+
+    # 5. 原子扣除余额
+    update_result = db.execute(
+        text(
+            "UPDATE user_balances "
+            "SET balance = balance - :amount "
+            "WHERE user_address = :addr AND balance >= :amount"
+        ),
+        {"addr": user_address, "amount": estimated_mon_wei}
+    )
+    db.commit()
+
+    if update_result.rowcount == 0:
+        return False, "Balance deduction failed (concurrent access)", current_balance_mon
+
+    return True, None, current_balance_mon
+
+
+def parse_sse_usage(line: str) -> Optional[dict]:
+    """
+    从 SSE 事件中解析 usage 数据
+
+    支持：
+    - message_start: 输入 tokens 和缓存 tokens
+    - message_delta: 输出 tokens
+
+    Args:
+        line: SSE 事件行
+
+    Returns:
+        解析的 usage 数据或 None
+    """
+    if not line.startswith("data:"):
+        return None
+
+    json_str = line[5:].strip()
+    if not json_str or json_str == "[DONE]":
+        return None
+
+    try:
+        data = json.loads(json_str)
+
+        # message_start 事件
+        if data.get("type") == "message_start":
+            usage = data.get("message", {}).get("usage", {})
+            return {
+                "type": "start",
+                "input_tokens": usage.get("input_tokens", 0),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+            }
+
+        # message_delta 事件
+        elif data.get("type") == "message_delta":
+            usage = data.get("usage", {})
+            if "output_tokens" in usage:
+                return {
+                    "type": "delta",
+                    "output_tokens": usage["output_tokens"]
+                }
+
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
+async def _log_usage(user_address: str, usage: dict):
+    """
+    记录真实的 token usage
+
+    可选功能：
+    - 保存到新表 claude_usage_logs
+    - 用于后续分析和对账
+
+    Args:
+        user_address: 用户地址
+        usage: usage 数据
+    """
+    try:
+        total_tokens = (
+            usage.get("input_tokens", 0) +
+            usage.get("output_tokens", 0) +
+            usage.get("cache_creation_input_tokens", 0) +
+            usage.get("cache_read_input_tokens", 0)
+        )
+
+        print(f"📊 Usage logged for {user_address}: {total_tokens} tokens")
+        print(f"   Input: {usage.get('input_tokens', 0)}, Output: {usage.get('output_tokens', 0)}")
+        print(f"   Cache Create: {usage.get('cache_creation_input_tokens', 0)}, Cache Read: {usage.get('cache_read_input_tokens', 0)}")
+
+        # TODO: 可以插入到数据库表以便后续分析
+        # db = get_db()
+        # try:
+        #     db.execute(text("INSERT INTO claude_usage_logs ..."))
+        #     db.commit()
+        # finally:
+        #     db.close()
+    except Exception as e:
+        print(f"⚠️  Failed to log usage: {e}")
+
+
+async def _non_stream_proxy(
+    backend_url: str,
+    request_body: dict,
+    headers: dict,
+    user_address: str
+):
+    """
+    非流式代理转发
+
+    Args:
+        backend_url: 后端服务地址
+        request_body: 请求体
+        headers: 请求头
+        user_address: 用户地址
+
+    Returns:
+        代理响应
+    """
+    async with httpx.AsyncClient(timeout=CLAUDE_REQUEST_TIMEOUT) as client:
+        response = await client.post(
+            backend_url,
+            json=request_body,
+            headers=headers
+        )
+
+        if response.status_code != 200:
+            # 透传后端错误
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content=response.json()
+                )
+            else:
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={"error": response.text}
+                )
+
+        result = response.json()
+
+        # 记录真实 usage（可选）
+        if "usage" in result:
+            await _log_usage(user_address, result["usage"])
+
+        return result
+
+
+async def _stream_proxy(
+    backend_url: str,
+    request_body: dict,
+    headers: dict,
+    user_address: str
+):
+    """
+    流式代理转发（SSE）
+
+    Args:
+        backend_url: 后端服务地址
+        request_body: 请求体
+        headers: 请求头
+        user_address: 用户地址
+
+    Returns:
+        StreamingResponse
+    """
+
+    async def stream_generator():
+        # 收集 usage 数据
+        usage_data = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=CLAUDE_REQUEST_TIMEOUT) as client:
+                async with client.stream(
+                    "POST",
+                    backend_url,
+                    json=request_body,
+                    headers=headers
+                ) as response:
+                    # 检查响应状态
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        yield f"event: error\n"
+                        yield f"data: {json.dumps({'error': error_text.decode()})}\n\n"
+                        return
+
+                    # 转发 SSE 事件
+                    async for line in response.aiter_lines():
+                        # 转发给客户端
+                        yield f"{line}\n"
+
+                        # 解析 usage 数据
+                        parsed = parse_sse_usage(line)
+                        if parsed:
+                            if parsed["type"] == "start":
+                                usage_data["input_tokens"] = parsed["input_tokens"]
+                                usage_data["cache_creation_input_tokens"] = parsed["cache_creation_input_tokens"]
+                                usage_data["cache_read_input_tokens"] = parsed["cache_read_input_tokens"]
+                            elif parsed["type"] == "delta":
+                                usage_data["output_tokens"] = parsed["output_tokens"]
+
+        except Exception as e:
+            yield f"event: error\n"
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        finally:
+            # 流结束后记录 usage
+            if usage_data["input_tokens"] > 0 or usage_data["output_tokens"] > 0:
+                await _log_usage(user_address, usage_data)
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@app.post("/api/v1/claude/messages")
+async def claude_proxy(
+    request: Request,
+    claude_request: ClaudeMessageRequest,
+    x_user_address: Optional[str] = Header(None)
+):
+    """
+    Claude API 代理接口
+
+    流程：
+    1. 验证用户地址
+    2. 检查并扣除余额
+    3. 转发请求到后端代理
+    4. 流式/非流式返回响应
+    5. 记录真实 usage（可选）
+    """
+    # 1. 验证配置
+    if not CLAUDE_BACKEND_URL or not CLAUDE_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Claude backend not configured"
+        )
+
+    # 2. 验证用户地址
+    if not x_user_address:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing X-User-Address header"
+        )
+
+    try:
+        user_address = Web3.to_checksum_address(x_user_address)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid user address"
+        )
+
+    # 3. 检查并扣除余额
+    db = get_db()
+    try:
+        max_tokens = claude_request.max_tokens or MAX_TOKENS_PER_REQUEST
+        success, error_msg, current_balance = await check_and_deduct_balance(
+            user_address, max_tokens, db
+        )
+
+        if not success:
+            estimated_mon = Decimal(max_tokens * 1.2) / Decimal(MON_TO_TOKEN_RATE)
+
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "error": "payment_required",
+                    "message": error_msg or "Insufficient MON balance",
+                    "current_balance_mon": str(current_balance) if current_balance else "0",
+                    "required_mon": str(estimated_mon)
+                }
+            )
+    finally:
+        db.close()
+
+    # 4. 准备代理请求
+    proxy_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CLAUDE_API_KEY}",
+        "anthropic-version": "2023-06-01",
+    }
+
+    # 透传客户端的特殊 header
+    if "anthropic-beta" in request.headers:
+        proxy_headers["anthropic-beta"] = request.headers["anthropic-beta"]
+
+    request_body = claude_request.model_dump(exclude_none=True)
+
+    # 5. 转发请求
+    try:
+        if claude_request.stream:
+            # 流式响应
+            return await _stream_proxy(
+                CLAUDE_BACKEND_URL,
+                request_body,
+                proxy_headers,
+                user_address
+            )
+        else:
+            # 非流式响应
+            return await _non_stream_proxy(
+                CLAUDE_BACKEND_URL,
+                request_body,
+                proxy_headers,
+                user_address
+            )
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Backend request timeout")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Backend service error: {str(e)}")
 
 
 if __name__ == "__main__":
