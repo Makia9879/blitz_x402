@@ -6,10 +6,12 @@ Python后端 - 使用x402协议处理加密货币充值和余额查询
 """
 import os
 import json
-from typing import Optional
+from typing import Optional, Union
+from decimal import Decimal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
@@ -17,6 +19,19 @@ from eth_account import Account
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+import httpx
+
+# 导入 x402 facilitator
+try:
+    from x402_facilitator import (
+        settle_payment,
+        create_payment_requirement,
+        verify_payment_signature,
+    )
+    FACILITATOR_AVAILABLE = True
+except ImportError:
+    print("[Warning] x402_facilitator module not found, facilitator features disabled")
+    FACILITATOR_AVAILABLE = False
 
 # 导入 x402 facilitator
 try:
@@ -50,6 +65,15 @@ MON_ADDRESS = os.getenv("MON_ADDRESS", "")  # MON ERC20代币地址（如果使�
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "10143"))
 TRANSIT_WALLET = os.getenv("TRANSIT_WALLET", "")  # 中转站钱包地址（接收 MON）
+
+# Claude API 代理配置
+CLAUDE_BACKEND_URL = os.getenv("CLAUDE_BACKEND_URL", "")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+MON_TO_TOKEN_RATE = int(os.getenv("MON_TO_TOKEN_RATE", "100000"))  # 1 MON = 10万 tokens
+MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "8192"))
+CLAUDE_REQUEST_TIMEOUT = int(os.getenv("CLAUDE_REQUEST_TIMEOUT", "300"))  # 秒
+DEFAULT_TEST_ADDRESS = os.getenv("DEFAULT_TEST_ADDRESS", "")  # 测试用默认地址（可选）
+SKIP_BALANCE_CHECK = os.getenv("SKIP_BALANCE_CHECK", "false").lower() == "true"  # 是否跳过余额检查
 
 # 数据库配置（MySQL）
 MYSQL_DSN = os.getenv(
@@ -188,6 +212,48 @@ class InternalRecharge(BaseModel):
     client_type: str = Field("x402-gateway", description="调用方类型")
 
 
+# ========== Claude API 代理相关模型 ==========
+
+class ClaudeMessage(BaseModel):
+    """Claude 消息"""
+    role: str
+    content: str
+
+
+class ClaudeMessageRequest(BaseModel):
+    """Claude API 请求（兼容 Claude API 格式）"""
+    model_config = {"extra": "allow"}  # 允许额外字段，确保兼容 Claude API 的所有参数
+
+    model: str
+    messages: list[dict]
+    max_tokens: Optional[int] = 4096
+    temperature: Optional[float] = 1.0
+    stream: Optional[bool] = False
+    system: Optional[Union[str, list[dict]]] = None  # 支持字符串或数组格式（prompt caching）
+    metadata: Optional[dict] = None
+    stop_sequences: Optional[list[str]] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[dict] = None
+
+
+class ClaudeUsageInfo(BaseModel):
+    """Token 使用统计"""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: Optional[int] = 0
+    cache_read_input_tokens: Optional[int] = 0
+
+
+class ClaudeErrorResponse(BaseModel):
+    """Claude 代理错误响应"""
+    error: str
+    message: str
+    current_balance_mon: Optional[str] = None
+    required_mon: Optional[str] = None
+
+
 # 工具函数
 def wei_to_mon(wei_amount: int) -> str:
     """将wei转换为MON（18位小数）"""
@@ -224,14 +290,19 @@ def check_mon_transfer(tx_hash: str, from_address: str, to_address: str, amount:
         if receipt.status != 1:
             print(f"Transaction failed with status: {receipt.status}")
             return False
-        
+
+        # 检查交易状态
+        if receipt.status != 1:
+            print(f"Transaction failed with status: {receipt.status}")
+            return False
+
         # 检查原生MON转账（value > 0）
         tx = w3.eth.get_transaction(tx_hash)
         if tx.value >= amount and tx.to and tx.to.lower() == to_address.lower():
             if tx['from'].lower() == from_address.lower():
                 print(f"Native MON transfer verified: {tx.value} wei from {from_address} to {to_address}")
                 return True
-        
+
         # 检查ERC20 MON转账（如果有MON_ADDRESS配置）
         if MON_ADDRESS:
             # 解析日志查找MON Transfer事件
@@ -245,8 +316,8 @@ def check_mon_transfer(tx_hash: str, from_address: str, to_address: str, amount:
                         if log.topics[0].hex() == transfer_topic:
                             log_from = "0x" + log.topics[1].hex()[-40:]
                             log_to = "0x" + log.topics[2].hex()[-40:]
-                            
-                            if (log_from.lower() == from_address.lower() and 
+
+                            if (log_from.lower() == from_address.lower() and
                                 log_to.lower() == to_address.lower()):
                                 # 解析金额
                                 transfer_amount = int(log.data.hex(), 16)
@@ -496,20 +567,20 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     status_code=400,
                     detail=f"Auto payment failed: {payment_result.get('error', 'Unknown error')}"
                 )
-            
+
             tx_hash = payment_result["tx_hash"]
             print(f"[Auto Recharge] Payment successful with user wallet, tx_hash={tx_hash}")
-        
+
         # 2.2 如果用户没有提供 private_key 和 tx_hash，且后端配置了 PRIVATE_KEY，使用服务账户自动代付
         elif not request.tx_hash and PRIVATE_KEY:
             print(f"[Auto Recharge] No user private key or tx_hash provided, using service account for auto payment")
-            
+
             # 使用服务账户的私钥代付
             service_account = Account.from_key(PRIVATE_KEY)
             service_address = service_account.address
-            
+
             print(f"[Auto Recharge] Service account: {service_address}, paying for user: {user_address}")
-            
+
             payment_result = send_mon_transaction(
                 from_address=service_address,  # 从服务账户支付
                 to_address=TRANSIT_WALLET,
@@ -522,21 +593,21 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     status_code=400,
                     detail=f"Service account auto payment failed: {payment_result.get('error', 'Unknown error')}"
                 )
-            
+
             tx_hash = payment_result["tx_hash"]
             auto_paid_by_service = True
             print(f"[Auto Recharge] Service account payment successful, tx_hash={tx_hash}")
-        
+
         # 3. 如果提供了 tx_hash，或者通过自动支付获得了 tx_hash，验证交易并完成充值
         if request.tx_hash:
             tx_hash = request.tx_hash
         elif payment_result and payment_result.get("tx_hash"):
             tx_hash = payment_result["tx_hash"]
-        
+
         if tx_hash:
-            
+
             print(f"[Recharge] Processing recharge: user={user_address}, amount={amount_wei} wei, tx_hash={tx_hash}")
-            
+
             # 3.1 验证链上 MON 转账
             # 如果是由 facilitator 代付，验证 facilitator 账户到 TRANSIT_WALLET 的转账
             # 如果是由服务账户代付，验证服务账户到 TRANSIT_WALLET 的转账
@@ -577,9 +648,9 @@ async def mcp_recharge(request: MCPRechargeRequest):
                                f"2. Transaction is from {user_address} to {TRANSIT_WALLET}\n"
                                f"3. Transaction amount >= {amount_wei} wei ({request.amount} MON)",
                     )
-            
+
             print(f"[Recharge] Transaction verified successfully: {tx_hash}")
-            
+
             # 3.2 在数据库中更新余额 + 写流水（幂等，原子操作）
             db = get_db()
             try:
@@ -591,7 +662,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     ),
                     {"u": user_address, "h": tx_hash},
                 ).first()
-                
                 if existing:
                     print(f"[Recharge] Transaction already processed: {tx_hash}")
                     row = db.execute(
@@ -605,7 +675,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                         tx_hash=tx_hash,
                         new_balance=str(balance),
                     )
-                
                 # 开始事务：写入充值记录（pending）
                 db.execute(
                     text(
@@ -621,7 +690,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     },
                 )
                 print(f"[Recharge] Recharge record created (pending): user={user_address}, amount={amount_wei}")
-                
                 # 更新 / 插入用户余额（原子操作）
                 db.execute(
                     text(
@@ -632,7 +700,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     {"u": user_address, "a": amount_wei},
                 )
                 print(f"[Recharge] User balance updated: user={user_address}, added={amount_wei}")
-                
                 # 标记充值记录为 success
                 db.execute(
                     text(
@@ -642,18 +709,17 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     {"u": user_address, "h": tx_hash},
                 )
                 print(f"[Recharge] Recharge record marked as success: tx_hash={tx_hash}")
-                
                 # 查询新余额
                 row = db.execute(
                     text("SELECT balance FROM user_balances WHERE user_address = :u"),
                     {"u": user_address},
                 ).first()
                 balance = int(row[0]) if row else 0
-                
+
                 # 提交事务
                 db.commit()
                 print(f"[Recharge] Recharge completed successfully: user={user_address}, new_balance={balance}")
-                
+
                 message = "Recharge successful via x402"
                 if paid_by_facilitator:
                     message += " (x402 facilitator payment)"
@@ -661,7 +727,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     message += " (user auto payment)"
                 elif auto_paid_by_service:
                     message += " (service account auto payment)"
-                
                 return DepositResponse(
                     success=True,
                     message=message,
@@ -677,10 +742,10 @@ async def mcp_recharge(request: MCPRechargeRequest):
                 )
             finally:
                 db.close()
-        
+
         # 4. 如果都没有提供，返回 402 支付要求（x402 协议标准）
         from fastapi.responses import JSONResponse
-        
+
         # 使用 facilitator 创建支付要求（如果可用）
         if FACILITATOR_AVAILABLE:
             payment_req = create_payment_requirement(
@@ -721,7 +786,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     "X-Payment-To": TRANSIT_WALLET,
                 }
             )
-            
     except HTTPException:
         raise
     except ValueError as e:
@@ -881,13 +945,19 @@ async def mcp_deposit_confirm(request: MCPDepositConfirm):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Deposit confirm failed: {e}")
+
+
 @app.post("/api/v1/balance", response_model=BalanceResponse)
-async def get_balance(request: BalanceQuery):
+async def get_balance():
     """
-    查询用户余额（链下 MySQL）
+    查询TRANSIT_WALLET余额（链下 MySQL）
+    此API总是查询TRANSIT_WALLET的余额，不需要传参数
     """
+    if not TRANSIT_WALLET:
+        raise HTTPException(status_code=500, detail="TRANSIT_WALLET not configured")
+    
     try:
-        user_address = Web3.to_checksum_address(request.user_address)
+        transit_address = Web3.to_checksum_address(TRANSIT_WALLET)
 
         db = get_db()
         try:
@@ -895,7 +965,7 @@ async def get_balance(request: BalanceQuery):
                 text(
                     "SELECT balance FROM user_balances WHERE user_address = :u"
                 ),
-                {"u": user_address},
+                {"u": transit_address},
             ).first()
         finally:
             db.close()
@@ -904,25 +974,402 @@ async def get_balance(request: BalanceQuery):
         balance_mon = wei_to_mon(balance_wei)
 
         return BalanceResponse(
-            user_address=user_address,
+            user_address=transit_address,
             balance=str(balance_wei),
             balance_mon=balance_mon,
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid address: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid TRANSIT_WALLET address: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
-@app.get("/api/v1/balance/{user_address}", response_model=BalanceResponse)
-async def get_balance_get(user_address: str):
+@app.get("/api/v1/balance", response_model=BalanceResponse)
+async def get_balance_get():
     """
-    查询用户余额（GET方式）
+    查询TRANSIT_WALLET余额（GET方式）
+    此API总是查询TRANSIT_WALLET的余额，不需要传参数
     """
-    return await get_balance(BalanceQuery(user_address=user_address))
+    return await get_balance()
+
+
+# ========== Claude API 代理相关函数 ==========
+
+async def check_and_deduct_balance(
+    user_address: str,
+    max_tokens: int,
+    db: Session
+) -> tuple[bool, Optional[str], Optional[Decimal]]:
+    """
+    检查余额并预扣费
+
+    Args:
+        user_address: 用户钱包地址
+        max_tokens: 请求的最大 tokens
+        db: 数据库 Session
+
+    Returns:
+        (成功标志, 错误信息, 当前余额 MON)
+    """
+    # 1. 地址标准化
+    try:
+        user_address = Web3.to_checksum_address(user_address)
+    except Exception as e:
+        return False, f"Invalid address: {str(e)}", None
+
+    # 2. 计算预估消耗（加 20% 安全系数）
+    estimated_tokens = max_tokens * 1.2
+    estimated_mon_wei = int((estimated_tokens / MON_TO_TOKEN_RATE) * 1e18)
+
+    # 3. 查询当前余额
+    result = db.execute(
+        text("SELECT balance FROM user_balances WHERE user_address = :addr"),
+        {"addr": user_address}
+    ).fetchone()
+
+    if not result:
+        return False, "User balance not found", None
+
+    current_balance = result[0]
+    current_balance_mon = Decimal(current_balance) / Decimal(1e18)
+
+    # 4. 检查余额
+    if current_balance < estimated_mon_wei:
+        return False, "Insufficient balance", current_balance_mon
+
+    # 5. 原子扣除余额
+    update_result = db.execute(
+        text(
+            "UPDATE user_balances "
+            "SET balance = balance - :amount "
+            "WHERE user_address = :addr AND balance >= :amount"
+        ),
+        {"addr": user_address, "amount": estimated_mon_wei}
+    )
+    db.commit()
+
+    if update_result.rowcount == 0:
+        return False, "Balance deduction failed (concurrent access)", current_balance_mon
+
+    return True, None, current_balance_mon
+
+
+def parse_sse_usage(line: str) -> Optional[dict]:
+    """
+    从 SSE 事件中解析 usage 数据
+
+    支持：
+    - message_start: 输入 tokens 和缓存 tokens
+    - message_delta: 输出 tokens
+
+    Args:
+        line: SSE 事件行
+
+    Returns:
+        解析的 usage 数据或 None
+    """
+    if not line.startswith("data:"):
+        return None
+
+    json_str = line[5:].strip()
+    if not json_str or json_str == "[DONE]":
+        return None
+
+    try:
+        data = json.loads(json_str)
+
+        # message_start 事件
+        if data.get("type") == "message_start":
+            usage = data.get("message", {}).get("usage", {})
+            return {
+                "type": "start",
+                "input_tokens": usage.get("input_tokens", 0),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+            }
+
+        # message_delta 事件
+        elif data.get("type") == "message_delta":
+            usage = data.get("usage", {})
+            if "output_tokens" in usage:
+                return {
+                    "type": "delta",
+                    "output_tokens": usage["output_tokens"]
+                }
+
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
+async def _log_usage(user_address: str, usage: dict):
+    """
+    记录真实的 token usage
+
+    可选功能：
+    - 保存到新表 claude_usage_logs
+    - 用于后续分析和对账
+
+    Args:
+        user_address: 用户地址
+        usage: usage 数据
+    """
+    try:
+        total_tokens = (
+            usage.get("input_tokens", 0) +
+            usage.get("output_tokens", 0) +
+            usage.get("cache_creation_input_tokens", 0) +
+            usage.get("cache_read_input_tokens", 0)
+        )
+
+        print(f"📊 Usage logged for {user_address}: {total_tokens} tokens")
+        print(f"   Input: {usage.get('input_tokens', 0)}, Output: {usage.get('output_tokens', 0)}")
+        print(f"   Cache Create: {usage.get('cache_creation_input_tokens', 0)}, Cache Read: {usage.get('cache_read_input_tokens', 0)}")
+
+        # TODO: 可以插入到数据库表以便后续分析
+        # db = get_db()
+        # try:
+        #     db.execute(text("INSERT INTO claude_usage_logs ..."))
+        #     db.commit()
+        # finally:
+        #     db.close()
+    except Exception as e:
+        print(f"⚠️  Failed to log usage: {e}")
+
+
+async def _non_stream_proxy(
+    backend_url: str,
+    request_body: dict,
+    headers: dict,
+    user_address: str
+):
+    """
+    非流式代理转发
+
+    Args:
+        backend_url: 后端服务地址
+        request_body: 请求体
+        headers: 请求头
+        user_address: 用户地址
+
+    Returns:
+        代理响应
+    """
+    async with httpx.AsyncClient(timeout=CLAUDE_REQUEST_TIMEOUT) as client:
+        response = await client.post(
+            backend_url,
+            json=request_body,
+            headers=headers
+        )
+
+        if response.status_code != 200:
+            # 透传后端错误
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content=response.json()
+                )
+            else:
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={"error": response.text}
+                )
+
+        result = response.json()
+
+        # 记录真实 usage（可选）
+        if "usage" in result:
+            await _log_usage(user_address, result["usage"])
+
+        return result
+
+
+async def _stream_proxy(
+    backend_url: str,
+    request_body: dict,
+    headers: dict,
+    user_address: str
+):
+    """
+    流式代理转发（SSE）
+
+    Args:
+        backend_url: 后端服务地址
+        request_body: 请求体
+        headers: 请求头
+        user_address: 用户地址
+
+    Returns:
+        StreamingResponse
+    """
+
+    async def stream_generator():
+        # 收集 usage 数据
+        usage_data = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=CLAUDE_REQUEST_TIMEOUT) as client:
+                async with client.stream(
+                    "POST",
+                    backend_url,
+                    json=request_body,
+                    headers=headers
+                ) as response:
+                    # 检查响应状态
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        yield f"event: error\n"
+                        yield f"data: {json.dumps({'error': error_text.decode()})}\n\n"
+                        return
+
+                    # 转发 SSE 事件
+                    async for line in response.aiter_lines():
+                        # 转发给客户端
+                        yield f"{line}\n"
+
+                        # 解析 usage 数据
+                        parsed = parse_sse_usage(line)
+                        if parsed:
+                            if parsed["type"] == "start":
+                                usage_data["input_tokens"] = parsed["input_tokens"]
+                                usage_data["cache_creation_input_tokens"] = parsed["cache_creation_input_tokens"]
+                                usage_data["cache_read_input_tokens"] = parsed["cache_read_input_tokens"]
+                            elif parsed["type"] == "delta":
+                                usage_data["output_tokens"] = parsed["output_tokens"]
+
+        except Exception as e:
+            yield f"event: error\n"
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        finally:
+            # 流结束后记录 usage
+            if usage_data["input_tokens"] > 0 or usage_data["output_tokens"] > 0:
+                await _log_usage(user_address, usage_data)
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@app.post("/v1/messages")
+async def claude_proxy(
+    request: Request,
+    claude_request: ClaudeMessageRequest,
+    x_user_address: Optional[str] = Header(None)
+):
+    """
+    Claude API 代理接口
+
+    流程：
+    1. 验证用户地址
+    2. 检查并扣除余额
+    3. 转发请求到后端代理
+    4. 流式/非流式返回响应
+    5. 记录真实 usage（可选）
+    """
+    # 1. 验证配置
+    if not CLAUDE_BACKEND_URL or not CLAUDE_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Claude backend not configured"
+        )
+
+    # 2. 验证用户地址（可选）
+    user_address = None
+    if x_user_address:
+        try:
+            user_address = Web3.to_checksum_address(x_user_address)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid user address"
+            )
+    elif DEFAULT_TEST_ADDRESS:
+        # 使用默认测试地址
+        user_address = Web3.to_checksum_address(DEFAULT_TEST_ADDRESS)
+        print(f"⚠️  Using default test address: {user_address}")
+
+    # 3. 检查并扣除余额（如果没有设置跳过余额检查且提供了用户地址）
+    if not SKIP_BALANCE_CHECK and user_address:
+        db = get_db()
+        try:
+            max_tokens = claude_request.max_tokens or MAX_TOKENS_PER_REQUEST
+            success, error_msg, current_balance = await check_and_deduct_balance(
+                user_address, max_tokens, db
+            )
+
+            if not success:
+                estimated_mon = Decimal(max_tokens * 1.2) / Decimal(MON_TO_TOKEN_RATE)
+
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "error": "payment_required",
+                        "message": error_msg or "Insufficient MON balance",
+                        "current_balance_mon": str(current_balance) if current_balance else "0",
+                        "required_mon": str(estimated_mon)
+                    }
+                )
+        finally:
+            db.close()
+    elif SKIP_BALANCE_CHECK:
+        # 跳过余额检查（开发/测试模式）
+        print("⚠️  SKIP_BALANCE_CHECK=true, skipping balance check")
+    else:
+        # 没有用户地址，跳过余额检查
+        print("⚠️  No user address provided, skipping balance check")
+
+    # 4. 准备代理请求
+    proxy_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CLAUDE_API_KEY}",
+        "anthropic-version": "2023-06-01",
+    }
+
+    # 透传客户端的特殊 header
+    if "anthropic-beta" in request.headers:
+        proxy_headers["anthropic-beta"] = request.headers["anthropic-beta"]
+
+    request_body = claude_request.model_dump(exclude_none=True)
+
+    # 5. 转发请求
+    try:
+        if claude_request.stream:
+            # 流式响应
+            return await _stream_proxy(
+                CLAUDE_BACKEND_URL,
+                request_body,
+                proxy_headers,
+                user_address
+            )
+        else:
+            # 非流式响应
+            return await _non_stream_proxy(
+                CLAUDE_BACKEND_URL,
+                request_body,
+                proxy_headers,
+                user_address
+            )
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Backend request timeout")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Backend service error: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
