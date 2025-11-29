@@ -1,4 +1,13 @@
-# 项目CC中转站
+<!--
+ * @Author: shasha0102 970284297@qq.com
+ * @Date: 2025-11-29 16:16:56
+ * @LastEditors: shasha0102 970284297@qq.com
+ * @LastEditTime: 2025-11-29 16:17:28
+ * @FilePath: /user-payment-platform/README.md
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+-->
+
+# 项目 CC 中转站
 
 开发一个 CC 中转站，用于提供 CC 的中转服务。
 

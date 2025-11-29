@@ -33,6 +33,18 @@ except ImportError:
     print("[Warning] x402_facilitator module not found, facilitator features disabled")
     FACILITATOR_AVAILABLE = False
 
+# 导入 x402 facilitator
+try:
+    from x402_facilitator import (
+        settle_payment,
+        create_payment_requirement,
+        verify_payment_signature,
+    )
+    FACILITATOR_AVAILABLE = True
+except ImportError:
+    print("[Warning] x402_facilitator module not found, facilitator features disabled")
+    FACILITATOR_AVAILABLE = False
+
 load_dotenv()
 
 app = FastAPI(title="x402 Payment Backend", version="1.1.0")
@@ -273,6 +285,11 @@ def check_mon_transfer(tx_hash: str, from_address: str, to_address: str, amount:
         except Exception as e:
             print(f"Transaction not found or not confirmed: {e}")
             return False
+        
+        # 检查交易状态
+        if receipt.status != 1:
+            print(f"Transaction failed with status: {receipt.status}")
+            return False
 
         # 检查交易状态
         if receipt.status != 1:
@@ -291,7 +308,7 @@ def check_mon_transfer(tx_hash: str, from_address: str, to_address: str, amount:
             # 解析日志查找MON Transfer事件
             # Transfer(address indexed from, address indexed to, uint256 value)
             transfer_topic = w3.keccak(text="Transfer(address,address,uint256)".encode()).hex()
-
+            
             for log in receipt.logs:
                 if log.address.lower() == MON_ADDRESS.lower():
                     if len(log.topics) >= 3:
@@ -392,7 +409,7 @@ def send_mon_transaction(
 ) -> dict:
     """
     发送 MON 转账交易
-
+    
     Returns:
         dict: {
             "success": bool,
@@ -403,26 +420,26 @@ def send_mon_transaction(
     try:
         account = Account.from_key(private_key)
         sender_address = account.address
-
+        
         # 验证地址匹配
         if from_address.lower() != sender_address.lower():
             return {
                 "success": False,
                 "error": f"Private key address ({sender_address}) doesn't match user_address ({from_address})"
             }
-
+        
         # 检查余额
         balance_wei = w3.eth.get_balance(sender_address)
         estimated_gas = 21000
         gas_price = w3.eth.gas_price
         total_cost = amount_wei + (estimated_gas * gas_price)
-
+        
         if balance_wei < total_cost:
             return {
                 "success": False,
                 "error": f"Insufficient balance. Need {wei_to_mon(total_cost)} MON (including gas), but have {wei_to_mon(balance_wei)} MON"
             }
-
+        
         # 构建交易
         nonce = w3.eth.get_transaction_count(sender_address)
         transaction = {
@@ -433,17 +450,17 @@ def send_mon_transaction(
             "nonce": nonce,
             "chainId": CHAIN_ID,
         }
-
+        
         # 签名并发送
         signed_txn = account.sign_transaction(transaction)
         tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
         tx_hash_hex = tx_hash.hex()
-
+        
         print(f"[Auto Payment] Transaction sent: {tx_hash_hex}")
-
+        
         # 等待确认
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-
+        
         if receipt.status == 1:
             return {
                 "success": True,
@@ -466,13 +483,13 @@ def send_mon_transaction(
 async def mcp_recharge(request: MCPRechargeRequest):
     """
     MCP tool 充值接口（通过 x402，集成自建 facilitator）
-
+    
     流程：
     1. 如果提供了 payment_signature，使用 x402 facilitator 验证签名并代付（推荐）
     2. 如果提供了 private_key，自动完成链上支付并确认充值
     3. 如果提供了 tx_hash，验证交易并确认充值
     4. 如果都没有提供，返回 402 支付要求
-
+    
     此接口确保充值流程完整执行，包括：
     - x402 facilitator 支付签名验证和代付
     - 链上交易验证（确保交易已确认且金额正确）
@@ -481,25 +498,25 @@ async def mcp_recharge(request: MCPRechargeRequest):
     """
     if not TRANSIT_WALLET:
         raise HTTPException(status_code=500, detail="TRANSIT_WALLET not configured")
-
+    
     try:
         # 1. 参数验证
         user_address = Web3.to_checksum_address(request.user_address)
         amount_wei = mon_to_wei(request.amount)
-
+        
         if amount_wei <= 0:
             raise HTTPException(status_code=400, detail="Invalid amount: amount must be greater than 0")
-
+        
         # 2. 支付逻辑
         tx_hash = None
         payment_result = None
         auto_paid_by_service = False  # 标记是否由服务账户代付
         paid_by_facilitator = False  # 标记是否由 facilitator 代付
-
+        
         # 2.0 如果提供了 payment_signature 或 payment_data，使用 x402 facilitator 代付（推荐方式）
         payment_signature = None
         payment_id = None
-
+        
         # 支持两种方式：直接提供 payment_signature，或通过 payment_data 对象提供
         if request.payment_data:
             # 从 payment_data 对象中提取签名和 ID
@@ -509,12 +526,12 @@ async def mcp_recharge(request: MCPRechargeRequest):
             # 直接提供 payment_signature
             payment_signature = request.payment_signature
             payment_id = request.payment_id
-
+        
         if payment_signature and FACILITATOR_AVAILABLE:
             print(f"[x402 Facilitator] Payment signature provided, using facilitator to settle payment")
             if payment_id:
                 print(f"[x402 Facilitator] Payment ID: {payment_id}")
-
+            
             # 调用 facilitator 结算支付
             facilitator_result = settle_payment(
                 user_address=user_address,
@@ -524,17 +541,17 @@ async def mcp_recharge(request: MCPRechargeRequest):
                 payment_id=payment_id,
                 chain_id=CHAIN_ID,
             )
-
+            
             if not facilitator_result["success"]:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Facilitator payment failed: {facilitator_result.get('error', 'Unknown error')}"
                 )
-
+            
             tx_hash = facilitator_result["tx_hash"]
             paid_by_facilitator = True
             print(f"[x402 Facilitator] Payment settled successfully, tx_hash={tx_hash}")
-
+        
         # 2.1 如果用户提供了 private_key，使用用户私钥支付
         elif request.private_key:
             print(f"[Auto Recharge] User private key provided, using user wallet for payment")
@@ -544,7 +561,7 @@ async def mcp_recharge(request: MCPRechargeRequest):
                 amount_wei=amount_wei,
                 private_key=request.private_key,
             )
-
+            
             if not payment_result["success"]:
                 raise HTTPException(
                     status_code=400,
@@ -570,7 +587,7 @@ async def mcp_recharge(request: MCPRechargeRequest):
                 amount_wei=amount_wei,
                 private_key=PRIVATE_KEY,
             )
-
+            
             if not payment_result["success"]:
                 raise HTTPException(
                     status_code=400,
@@ -645,7 +662,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     ),
                     {"u": user_address, "h": tx_hash},
                 ).first()
-
                 if existing:
                     print(f"[Recharge] Transaction already processed: {tx_hash}")
                     row = db.execute(
@@ -659,7 +675,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                         tx_hash=tx_hash,
                         new_balance=str(balance),
                     )
-
                 # 开始事务：写入充值记录（pending）
                 db.execute(
                     text(
@@ -675,7 +690,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     },
                 )
                 print(f"[Recharge] Recharge record created (pending): user={user_address}, amount={amount_wei}")
-
                 # 更新 / 插入用户余额（原子操作）
                 db.execute(
                     text(
@@ -686,7 +700,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     {"u": user_address, "a": amount_wei},
                 )
                 print(f"[Recharge] User balance updated: user={user_address}, added={amount_wei}")
-
                 # 标记充值记录为 success
                 db.execute(
                     text(
@@ -696,7 +709,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     {"u": user_address, "h": tx_hash},
                 )
                 print(f"[Recharge] Recharge record marked as success: tx_hash={tx_hash}")
-
                 # 查询新余额
                 row = db.execute(
                     text("SELECT balance FROM user_balances WHERE user_address = :u"),
@@ -715,7 +727,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     message += " (user auto payment)"
                 elif auto_paid_by_service:
                     message += " (service account auto payment)"
-
                 return DepositResponse(
                     success=True,
                     message=message,
@@ -775,7 +786,6 @@ async def mcp_recharge(request: MCPRechargeRequest):
                     "X-Payment-To": TRANSIT_WALLET,
                 }
             )
-
     except HTTPException:
         raise
     except ValueError as e:
