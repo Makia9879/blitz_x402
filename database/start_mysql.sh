@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS recharge_records (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uniq_user_tx (user_address, tx_hash)
 );
+
+-- 插入初始用户余额记录
+INSERT INTO user_balances (user_address, balance) 
+VALUES ('0x97EC65A46a33a11727e430393B57010909f4bb4D', 0) 
+ON DUPLICATE KEY UPDATE balance = 0;
 SQL
 
 echo "MySQL is up and tables are created."
