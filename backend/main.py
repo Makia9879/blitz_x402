@@ -948,12 +948,16 @@ async def mcp_deposit_confirm(request: MCPDepositConfirm):
 
 
 @app.post("/api/v1/balance", response_model=BalanceResponse)
-async def get_balance(request: BalanceQuery):
+async def get_balance():
     """
-    查询用户余额（链下 MySQL）
+    查询TRANSIT_WALLET余额（链下 MySQL）
+    此API总是查询TRANSIT_WALLET的余额，不需要传参数
     """
+    if not TRANSIT_WALLET:
+        raise HTTPException(status_code=500, detail="TRANSIT_WALLET not configured")
+    
     try:
-        user_address = Web3.to_checksum_address(request.user_address)
+        transit_address = Web3.to_checksum_address(TRANSIT_WALLET)
 
         db = get_db()
         try:
@@ -961,7 +965,7 @@ async def get_balance(request: BalanceQuery):
                 text(
                     "SELECT balance FROM user_balances WHERE user_address = :u"
                 ),
-                {"u": user_address},
+                {"u": transit_address},
             ).first()
         finally:
             db.close()
@@ -970,22 +974,23 @@ async def get_balance(request: BalanceQuery):
         balance_mon = wei_to_mon(balance_wei)
 
         return BalanceResponse(
-            user_address=user_address,
+            user_address=transit_address,
             balance=str(balance_wei),
             balance_mon=balance_mon,
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid address: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid TRANSIT_WALLET address: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
-@app.get("/api/v1/balance/{user_address}", response_model=BalanceResponse)
-async def get_balance_get(user_address: str):
+@app.get("/api/v1/balance", response_model=BalanceResponse)
+async def get_balance_get():
     """
-    查询用户余额（GET方式）
+    查询TRANSIT_WALLET余额（GET方式）
+    此API总是查询TRANSIT_WALLET的余额，不需要传参数
     """
-    return await get_balance(BalanceQuery(user_address=user_address))
+    return await get_balance()
 
 
 # ========== Claude API 代理相关函数 ==========
