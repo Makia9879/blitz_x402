@@ -6,7 +6,7 @@ Python后端 - 使用x402协议处理加密货币充值和余额查询
 """
 import os
 import json
-from typing import Optional
+from typing import Optional, Union
 from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException, Request, Header
@@ -48,6 +48,8 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 MON_TO_TOKEN_RATE = int(os.getenv("MON_TO_TOKEN_RATE", "100000"))  # 1 MON = 10万 tokens
 MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "8192"))
 CLAUDE_REQUEST_TIMEOUT = int(os.getenv("CLAUDE_REQUEST_TIMEOUT", "300"))  # 秒
+DEFAULT_TEST_ADDRESS = os.getenv("DEFAULT_TEST_ADDRESS", "")  # 测试用默认地址（可选）
+SKIP_BALANCE_CHECK = os.getenv("SKIP_BALANCE_CHECK", "false").lower() == "true"  # 是否跳过余额检查
 
 # 数据库配置（MySQL）
 MYSQL_DSN = os.getenv(
@@ -181,16 +183,20 @@ class ClaudeMessage(BaseModel):
 
 class ClaudeMessageRequest(BaseModel):
     """Claude API 请求（兼容 Claude API 格式）"""
+    model_config = {"extra": "allow"}  # 允许额外字段，确保兼容 Claude API 的所有参数
+
     model: str
     messages: list[dict]
     max_tokens: Optional[int] = 4096
     temperature: Optional[float] = 1.0
     stream: Optional[bool] = False
-    system: Optional[str] = None
+    system: Optional[Union[str, list[dict]]] = None  # 支持字符串或数组格式（prompt caching）
     metadata: Optional[dict] = None
     stop_sequences: Optional[list[str]] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[dict] = None
 
 
 class ClaudeUsageInfo(BaseModel):
@@ -802,7 +808,7 @@ async def _stream_proxy(
     )
 
 
-@app.post("/api/v1/claude/messages")
+@app.post("/v1/messages")
 async def claude_proxy(
     request: Request,
     claude_request: ClaudeMessageRequest,
@@ -825,43 +831,50 @@ async def claude_proxy(
             detail="Claude backend not configured"
         )
 
-    # 2. 验证用户地址
-    if not x_user_address:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing X-User-Address header"
-        )
-
-    try:
-        user_address = Web3.to_checksum_address(x_user_address)
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid user address"
-        )
-
-    # 3. 检查并扣除余额
-    db = get_db()
-    try:
-        max_tokens = claude_request.max_tokens or MAX_TOKENS_PER_REQUEST
-        success, error_msg, current_balance = await check_and_deduct_balance(
-            user_address, max_tokens, db
-        )
-
-        if not success:
-            estimated_mon = Decimal(max_tokens * 1.2) / Decimal(MON_TO_TOKEN_RATE)
-
-            return JSONResponse(
-                status_code=402,
-                content={
-                    "error": "payment_required",
-                    "message": error_msg or "Insufficient MON balance",
-                    "current_balance_mon": str(current_balance) if current_balance else "0",
-                    "required_mon": str(estimated_mon)
-                }
+    # 2. 验证用户地址（可选）
+    user_address = None
+    if x_user_address:
+        try:
+            user_address = Web3.to_checksum_address(x_user_address)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid user address"
             )
-    finally:
-        db.close()
+    elif DEFAULT_TEST_ADDRESS:
+        # 使用默认测试地址
+        user_address = Web3.to_checksum_address(DEFAULT_TEST_ADDRESS)
+        print(f"⚠️  Using default test address: {user_address}")
+
+    # 3. 检查并扣除余额（如果没有设置跳过余额检查且提供了用户地址）
+    if not SKIP_BALANCE_CHECK and user_address:
+        db = get_db()
+        try:
+            max_tokens = claude_request.max_tokens or MAX_TOKENS_PER_REQUEST
+            success, error_msg, current_balance = await check_and_deduct_balance(
+                user_address, max_tokens, db
+            )
+
+            if not success:
+                estimated_mon = Decimal(max_tokens * 1.2) / Decimal(MON_TO_TOKEN_RATE)
+
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "error": "payment_required",
+                        "message": error_msg or "Insufficient MON balance",
+                        "current_balance_mon": str(current_balance) if current_balance else "0",
+                        "required_mon": str(estimated_mon)
+                    }
+                )
+        finally:
+            db.close()
+    elif SKIP_BALANCE_CHECK:
+        # 跳过余额检查（开发/测试模式）
+        print("⚠️  SKIP_BALANCE_CHECK=true, skipping balance check")
+    else:
+        # 没有用户地址，跳过余额检查
+        print("⚠️  No user address provided, skipping balance check")
 
     # 4. 准备代理请求
     proxy_headers = {
