@@ -1297,10 +1297,35 @@ async def claude_proxy(
                 status_code=400,
                 detail="Invalid user address"
             )
-    elif DEFAULT_TEST_ADDRESS:
-        # 使用默认测试地址
-        user_address = Web3.to_checksum_address(DEFAULT_TEST_ADDRESS)
-        print(f"⚠️  Using default test address: {user_address}")
+    else:
+        # 如果没有提供 x_user_address，查询数据库
+        # 如果数据库中只有一条记录，就用那条记录的地址
+        db = get_db()
+        try:
+            rows = db.execute(
+                text("SELECT user_address FROM user_balances WHERE balance > 0")
+            ).fetchall()
+
+            if len(rows) == 1:
+                # 数据库中只有一条记录，使用该地址
+                user_address = Web3.to_checksum_address(rows[0][0])
+                print(f"📌 Using address from database (only one record): {user_address}")
+            elif len(rows) > 1:
+                # 数据库中有多条记录，无法确定使用哪个，回退到环境变量
+                if DEFAULT_TEST_ADDRESS:
+                    user_address = Web3.to_checksum_address(DEFAULT_TEST_ADDRESS)
+                    print(f"⚠️  Multiple addresses in database ({len(rows)} records), using default test address: {user_address}")
+                else:
+                    print(f"⚠️  Multiple addresses in database ({len(rows)} records) and no DEFAULT_TEST_ADDRESS configured")
+            else:
+                # 数据库中没有记录，使用环境变量的默认地址
+                if DEFAULT_TEST_ADDRESS:
+                    user_address = Web3.to_checksum_address(DEFAULT_TEST_ADDRESS)
+                    print(f"⚠️  No balance records in database, using default test address: {user_address}")
+                else:
+                    print(f"⚠️  No balance records in database and no DEFAULT_TEST_ADDRESS configured")
+        finally:
+            db.close()
 
     # 3. 检查并扣除余额（如果没有设置跳过余额检查且提供了用户地址）
     if not SKIP_BALANCE_CHECK and user_address:
